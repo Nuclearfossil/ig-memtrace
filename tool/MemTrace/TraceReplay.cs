@@ -16,10 +16,20 @@ namespace MemTrace
     Recording
   }
 
-  public struct AddressRange
+  public struct AddressRange : IEquatable<AddressRange>
   {
     public ulong BaseAddress;
     public ulong SizeBytes;
+
+    public override int GetHashCode()
+    {
+      return (int) ((BaseAddress * 13) ^ SizeBytes);
+    }
+
+    public bool Equals(AddressRange other)
+    {
+      return other.BaseAddress == this.BaseAddress && other.SizeBytes == this.SizeBytes;
+    }
   };
 
   public sealed class HeapInfo
@@ -442,10 +452,11 @@ namespace MemTrace
           double pct = (m_CurrentTime - start) / (end - start);
           status_callback(Math.Min(pct, 1.0));
         }
-        if (!NextEvent())
+        if (!NextEvent(secs))
           break;
         ++i;
       }
+
       while (secs < m_CurrentTime)
       {
         if (0 == (i & 1023) && status_callback != null)
@@ -453,7 +464,7 @@ namespace MemTrace
           double pct = (m_CurrentTime - start) / (end - start);
           status_callback(Math.Min(pct, 1.0));
         }
-        if (!PrevEvent())
+        if (!PrevEvent(secs))
           break;
         ++i;
       }
@@ -461,7 +472,7 @@ namespace MemTrace
       OnEndSeek(secs);
     }
 
-    protected bool NextEvent()
+    protected bool NextEvent(double? maxTime)
     {
       var v = m_MmapView;
       var pos = m_MmapPos;
@@ -475,6 +486,9 @@ namespace MemTrace
       EventHeader.Decode(out header, v, ref pos);
 
       bool hasHeapIds = MetaData.Version >= 3;
+
+      if (maxTime.HasValue && header.TimeStamp > maxTime.Value)
+        return false;
 
       m_CurrentTime = header.TimeStamp;
 
@@ -578,7 +592,7 @@ namespace MemTrace
       return true;
     }
 
-    protected bool PrevEvent()
+    protected bool PrevEvent(double? minTime)
     {
       var v = m_MmapView;
 
@@ -593,9 +607,19 @@ namespace MemTrace
 
       bool isV3 = MetaData.Version >= 3;
 
+      EventHeader headerSkip;
+      EventHeader.Decode(out headerSkip, v, ref pos);
+
+      pos = m_MmapPos - headerSkip.BackLink;
+      var resetPos = pos;
       EventHeader header;
       EventHeader.Decode(out header, v, ref pos);
 
+      if (minTime.HasValue && minTime > header.TimeStamp)
+      {
+          m_MmapPos = inpos;
+          return false;
+      }
       m_CurrentTime = header.TimeStamp;
 
       switch (header.Code)
@@ -752,7 +776,7 @@ namespace MemTrace
           throw new IOException(String.Format("Unexpected event code {0} in stream at position {1}", header.Code, m_MmapPos));
       }
 
-      m_MmapPos = inpos - header.BackLink;
+      m_MmapPos = resetPos;
       return true;
     }
 
@@ -861,10 +885,10 @@ namespace MemTrace
   public sealed class TraceReplayStateful : TraceProcessorBase
   {
     private Dictionary<ulong, HeapInfo> m_Heaps = new Dictionary<ulong, HeapInfo>();
-    private Dictionary<ulong, HeapAllocationInfo> m_Allocs = new Dictionary<ulong, HeapAllocationInfo>();
+    private Dictionary<AllocationKey, HeapAllocationInfo> m_Allocs = new Dictionary<AllocationKey, HeapAllocationInfo>();
 
     public IReadOnlyDictionary<ulong, HeapInfo> Heaps { get { return m_Heaps; } }
-    public IReadOnlyDictionary<ulong, HeapAllocationInfo> HeapAllocations { get { return m_Allocs; } }
+    public IReadOnlyDictionary<AllocationKey, HeapAllocationInfo> HeapAllocations { get { return m_Allocs; } }
 
     public List<HeapAllocationInfo> AllocationsByAddress { get { return m_SortedAllocs; } }
     public List<HeapAllocationInfo> m_SortedAllocs = new List<HeapAllocationInfo>();
@@ -892,13 +916,14 @@ namespace MemTrace
 
     protected override void OnHeapFree(int heapId, ulong ptr, int stack_index, double time)
     {
-      m_Allocs.Remove(ptr);
+      m_Allocs.Remove(new AllocationKey { HeapId = (ulong) heapId, Address = ptr });
     }
 
     protected override void OnHeapAllocate(int heapId, ulong ptr, ulong size, int scope_type, int scope_data_str, int stack_index, double time)
     {
       var heap = FindHeap(heapId, ptr);
-      m_Allocs[ptr] = new HeapAllocationInfo
+      var key = new AllocationKey { HeapId = (ulong)heapId, Address = ptr };
+      m_Allocs[key] = new HeapAllocationInfo
       {
         ScopeType = scope_type,
         ScopeData = GetStringByIndex(scope_data_str),
@@ -987,7 +1012,7 @@ namespace MemTrace
 
       double max_time = this.MetaData.MaxTimeStamp / (double)this.MetaData.TimerFrequency;
 
-      while (NextEvent())
+      while (NextEvent(null))
       {
         if (0 == (i & 1023))
         {

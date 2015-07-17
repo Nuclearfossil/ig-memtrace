@@ -148,11 +148,12 @@ namespace MemTrace
 
   //-----------------------------------------------------------------------------
   // Platform-dependent routine to walk stack and generate a backtrace
-  static int GetBackTrace(uint64_t frames[], uint64_t *hash_out, int skip_levels);
+  static int GetBackTrace(uintptr_t frames[], uint64_t *hash_out, int skip_levels);
 
   //-----------------------------------------------------------------------------
   // Minimal hash table mapping 64-bit numbers to 64-bit numbers.
   // Used exclusively by the slot cache. 
+  //
   template <size_t MaxCount>
   struct FixedHash64
   {
@@ -217,34 +218,49 @@ namespace MemTrace
     void Remove(uint64_t key)
     {
       uint32_t index = uint32_t(key & kArrayMask);
-      uint32_t start_index = index;
 
       while (m_Keys[index] && m_Keys[index] != key)
       {
         index = (index + 1) & kArrayMask;
       }
 
-      // Move following items that also hash to the same start index.
+      if (m_Keys[index] != key)
+      {
+        return;
+      }
+
+      m_Keys[index] = 0;
+      m_Values[index] = 0;
+
+      // Move following items that may have landed there due to collisions.
       uint32_t src_index = (index + 1) & kArrayMask;
 
       for (;;)
       {
         uint64_t k = m_Keys[src_index];
-        
-        if (!k || (k & kArrayMask) != start_index)
+
+        if (!k)
         {
+          // Stop moving if the slot is unused
           break;
         }
+        else if ((k & kArrayMask) != src_index)
+        {
+          // Skip things that are in the right place.
 
-        m_Keys[index] = k;
-        m_Keys[src_index] = 0;
+          uint64_t bv = m_Values[src_index];
 
-        index = src_index;
-        src_index = (src_index + 1) & kArrayMask;
+          m_Keys[src_index]   = 0;
+          m_Values[src_index] = 0;
+
+          Insert(k, bv);
+
+          index               = src_index;
+        }
+        src_index           = (src_index + 1) & kArrayMask;
       }
     }
   };
-  
 
   //-----------------------------------------------------------------------------
   // An O(1) windowing lookup structure for compression purposes.
@@ -470,7 +486,7 @@ namespace MemTrace
     {
       s_Stats.m_StackCount++;
 
-      uint64_t frames[kMaxFrames];
+      uintptr_t frames[kMaxFrames];
       uint64_t stack_hash;
       uint64_t seqno;
 
@@ -864,8 +880,55 @@ void MemTrace::InitSocket(const char *server_ip_address, int server_port)
     }
   };
 
-  InitCommon(write_block_fn);
-  S.m_Socket = sock;
+  if (!was_active)
+  {
+    InitCommon(write_block_fn);
+    S.m_Socket = sock;
+  }
+  else
+  {
+    S.m_Socket = sock;
+    MemTracePrint("MemTrace: Switching to socket transport\n");
+    S.m_Encoder.Flush();
+
+    FileHandle fh = S.m_BootFile;
+
+    if (int64_t sz = FileSize(fh))
+    {
+      FileSeekTo(fh, 0);
+
+      char buf[1024];
+      size_t remain = (size_t) sz;
+      while (remain)
+      {
+        size_t copy_size = remain;
+        if (copy_size > ARRAY_SIZE(buf))
+          copy_size = ARRAY_SIZE(buf);
+
+        FileRead(fh, buf, copy_size);
+        if (copy_size != send(sock, buf, (int) copy_size, 0))
+        {
+          MemTracePrint("send() failed while uploading trace file, shutting down.\n");
+          error = true;
+        }
+
+        remain -= copy_size;
+      }
+    }
+
+    FileClose(fh);
+    S.m_BootFile = kInvalidFileHandle;
+
+    // Clean up the temporary file.
+#if defined(MEMTRACE_WINDOWS)
+    DeleteFileA(S.m_BootFileName);
+#else
+    remove(S.m_BootFileName);
+#endif
+
+    // Switch to socket transmit method
+    S.m_Encoder.SetTransmitFn(write_block_fn);
+  }
 
   if (was_active)
   {
@@ -1183,7 +1246,7 @@ void MemTrace::RefreshLoadedModules()
 }
 
 #if defined(MEMTRACE_WINDOWS)
-int MemTrace::GetBackTrace(uint64_t frames[], uint64_t *hash_out, int skip_levels)
+int MemTrace::GetBackTrace(uintptr_t frames[], uint64_t *hash_out, int skip_levels)
 {
   DWORD hash = 0;
 
@@ -1197,7 +1260,7 @@ int MemTrace::GetBackTrace(uint64_t frames[], uint64_t *hash_out, int skip_level
 
 #elif defined(MEMTRACE_MAC)
 
-int MemTrace::GetBackTrace(uint64_t frames[], uint64_t *hash_out, int skip_levels)
+int MemTrace::GetBackTrace(uintptr_t frames[], uint64_t *hash_out, int skip_levels)
 {
   int count = backtrace((void**)frames, kMaxFrames);
   int skip_count = skip_levels > count ? count : skip_levels;
@@ -1224,7 +1287,7 @@ int MemTrace::GetBackTrace(uint64_t frames[], uint64_t *hash_out, int skip_level
 // pointer omission not being disabled. (Which is the default on most
 // compilers & platforms. You might want to do something different.)
 
-int __attribute__((noinline)) MemTrace::GetBackTrace(uint64_t frames[], uint64_t *hash_out, int skip_levels)
+int __attribute__((noinline)) MemTrace::GetBackTrace(uintptr_t frames[], uint64_t *hash_out, int skip_levels)
 {
   // Grab address of current frame.
   const uintptr_t* fp   = (const uintptr_t*) __builtin_frame_address(0);
